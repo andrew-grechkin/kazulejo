@@ -1,0 +1,15 @@
+pkgbase = kazulejo-git
+	pkgdesc = Class-based window rules and a configurable tiling layout for KWin
+	pkgver = 0.8.0
+	pkgrel = 1
+	url = https://github.com/andrew-grechkin/kazulejo
+	arch = any
+	license = MIT
+	makedepends = git
+	depends = argc
+	depends = diffutils
+	depends = plasma-desktop
+	source = kazulejo-git::git+https://github.com/andrew-grechkin/kazulejo
+	sha256sums = SKIP
+
+pkgname = kazulejo-git
