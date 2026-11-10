@@ -1,0 +1,5 @@
+# makepkg
+src/
+pkg/
+kazulejo-git/
+*.pkg.tar.*

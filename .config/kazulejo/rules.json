@@ -1,0 +1,105 @@
+{
+  "rules": [
+    {
+      "desktop": "all",
+      "float": true,
+      "layer": "above",
+      "match": {
+        "class": "mpv"
+      },
+      "position": {
+        "left": "78%",
+        "top": "78%"
+      },
+      "size": {
+        "width": "20%"
+      }
+    },
+    {
+      "desktop": "all",
+      "float": true,
+      "layer": "above",
+      "match": {
+        "class": "opera",
+        "title": "Picture in Picture"
+      },
+      "position": {
+        "left": "79%",
+        "top": "80%"
+      },
+      "size": {
+        "height": "18%",
+        "width": "20%"
+      }
+    },
+    {
+      "desktop": 1,
+      "follow": true,
+      "match": {
+        "class": "opera"
+      }
+    },
+    {
+      "desktop": 2,
+      "follow": true,
+      "match": {
+        "class": "google-chrome"
+      }
+    },
+    {
+      "desktop": 3,
+      "follow": true,
+      "match": {
+        "class": [
+          "com.valvesoftware.Steam",
+          "io.github.unknownskl.greenlight",
+          "steam"
+        ]
+      }
+    },
+    {
+      "desktop": 4,
+      "follow": true,
+      "match": {
+        "class": "ffplay"
+      }
+    },
+    {
+      "desktop": 10,
+      "follow": true,
+      "match": {
+        "class": "Main-Tmux"
+      }
+    },
+    {
+      "float": true,
+      "match": {
+        "class": [
+          "org.kde.plasma.emojier",
+          "org.kde.CrowTranslate",
+          "qalculate-gtk"
+        ]
+      }
+    },
+    {
+      "float": true,
+      "match": {
+        "class": "TermFloatingSmall"
+      },
+      "size": {
+        "height": "40%",
+        "width": "40%"
+      }
+    },
+    {
+      "float": true,
+      "match": {
+        "class": "TermFloating"
+      },
+      "size": {
+        "height": "60%",
+        "width": "60%"
+      }
+    }
+  ]
+}

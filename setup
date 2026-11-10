@@ -1,0 +1,1125 @@
+#!/usr/bin/env -S bash -Eeuo pipefail
+# shellcheck disable=SC2154
+
+# @describe ABSTRACT:
+#   Set up and apply class-based window rules for KWin
+#
+# SYNOPSIS:
+#   setup [OPTIONS]
+#
+# DESCRIPTION:
+#   First-time setup:
+#
+#       ./setup --apply
+#
+#   The command seeds ~/.config/kazulejo/config.json and ~/.config/kazulejo/rules.json if they are missing, installs the
+#   KWin package, enables the script, installs a login autostart entry, applies the window rules, and ensures the
+#   virtual desktops and shortcuts.
+#   It is idempotent.
+#
+#   Preview every change by omitting --apply:
+#
+#       ./setup
+#
+#   The autostart entry runs the script with `--apply --quiet` on login, so rule edits are applied without opening a
+#   terminal.
+#
+#   The AUR package installs the same script as `kazulejo`.
+
+# @meta combine-shorts
+# @meta require-tools awk,busctl,cmp,diff,kreadconfig6,kwriteconfig6,qdbus6,xkbcli
+# @meta version 0.8.0
+# @flag -a --apply Apply all setup and rule changes (default: preview)
+# @flag -q --quiet Suppress progress messages (used by autostart)
+
+# argc parses this file. When it is not installed, fetch a pinned release into the user's data directory. Downloads are
+# checksum-verified and never need root. Set KAZULEJO_NO_AUTOFETCH=1 to disable, or KAZULEJO_ARGC=/path/to/argc to use a
+# specific binary.
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+readonly SCRIPT_PATH
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+readonly SCRIPT_DIR
+
+readonly ARGC_FETCH_SCRIPT="${SCRIPT_DIR}/.fetch-argc.bash"
+
+function resolve-argc() {
+    if [[ -n "${KAZULEJO_ARGC:-}" ]]; then
+        [[ -x "$KAZULEJO_ARGC" ]] || {
+            printf 'error: KAZULEJO_ARGC is not executable: %s\n' "$KAZULEJO_ARGC" >&2
+            exit 2
+        }
+        printf '%s\n' "$KAZULEJO_ARGC"
+        return 0
+    fi
+
+    if command -v argc >/dev/null 2>&1; then
+        command -v argc
+        return 0
+    fi
+
+    [[ -r "$ARGC_FETCH_SCRIPT" ]] || {
+        printf 'error: cannot read %s\n' "$ARGC_FETCH_SCRIPT" >&2
+        exit 2
+    }
+
+    # shellcheck source=.fetch-argc.bash
+    source "$ARGC_FETCH_SCRIPT"
+    fetch-argc
+}
+
+ARGC_BIN=$(resolve-argc)
+readonly ARGC_BIN
+
+readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+readonly CONFIG_FILE="${CONFIG_HOME}/kazulejo/config.json"
+readonly RULES_FILE="${CONFIG_HOME}/kazulejo/rules.json"
+readonly BUNDLED_CONFIG="${SCRIPT_DIR}/.config/kazulejo/config.json"
+readonly BUNDLED_RULES="${SCRIPT_DIR}/.config/kazulejo/rules.json"
+readonly RULES_QML="${SCRIPT_DIR}/script/rules.qml"
+readonly PACKAGE_DIR="$SCRIPT_DIR"
+readonly PACKAGE_ENTRY='contents/ui/main.qml'
+readonly SCRIPT_ID='kazulejo'
+readonly DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+readonly INSTALL_DIR="${DATA_HOME}/kwin/scripts/${SCRIPT_ID}"
+readonly APPLETS_CONFIG="${CONFIG_HOME}/plasma-org.kde.plasma.desktop-appletsrc"
+readonly PAGER_PLUGIN='org.kde.plasma.pager'
+readonly PAGER_DISPLAYED_TEXT='Number'
+readonly PAGER_SHOW_WINDOW_ICONS='true'
+readonly TASK_SHOW_ONLY_CURRENT_DESKTOP='false'
+readonly TASK_GROUPING_STRATEGY='0'
+readonly TABBOX_GROUP='TabBox'
+readonly TABBOX_ALTERNATIVE_GROUP='TabBoxAlternative'
+readonly TABBOX_HIGHLIGHT_WINDOWS_KEY='HighlightWindows'
+readonly TABBOX_HIGHLIGHT_WINDOWS='false'
+readonly KWIN_CONFIG='kwinrc'
+readonly SCRIPT_GROUP="Script-${SCRIPT_ID}"
+readonly CONFIG_KEY='rules'
+readonly AUTOSTART_DIR="${CONFIG_HOME}/autostart"
+readonly AUTOSTART_FILE="${AUTOSTART_DIR}/${SCRIPT_ID}.desktop"
+
+readonly DESKTOP_MANAGER_DEST='org.kde.KWin'
+readonly DESKTOP_MANAGER_PATH='/VirtualDesktopManager'
+readonly DESKTOP_MANAGER_IFACE='org.kde.KWin.VirtualDesktopManager'
+readonly KGA_DEST='org.kde.kglobalaccel'
+readonly KGA_PATH='/kglobalaccel'
+readonly KGA_IFACE='org.kde.KGlobalAccel'
+readonly KWIN_COMPONENT='kwin'
+readonly KWIN_COMPONENT_FRIENDLY='KWin'
+readonly KGA_FLAGS=6
+readonly META_MODIFIER=$((0x10000000))
+readonly SHIFT_MODIFIER=$((0x02000000))
+readonly DIGIT_OFFSET=$((0x30))
+DESKTOPS=10
+declare -A SHIFTED_KEYS=()
+SHIFTED_KEYS_LOADED=0
+
+APPLY=0
+QUIET=0
+PACKAGE_CHANGED=0
+RULES_CHANGED=0
+SHORTCUTS_CHANGED=0
+
+function note() {
+    if ((QUIET)); then
+        return 0
+    fi
+    printf '==> %s\n' "$*"
+}
+
+function fatal() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+function kwin-running() {
+    qdbus6 org.kde.KWin /KWin >/dev/null 2>&1
+}
+
+function resolve-file() {
+    local file=$1 bundled=$2 name=$3
+
+    if [[ -e "$file" ]]; then
+        [[ -f "$file" && -r "$file" ]] || fatal "${name} is not a readable file: ${file}"
+        printf '%s\n' "$file"
+    elif [[ -f "$bundled" && -r "$bundled" ]]; then
+        printf '%s\n' "$bundled"
+    else
+        fatal "${name} not found: ${file}"
+    fi
+}
+
+function qml-runtime() {
+    if command -v qml6 >/dev/null 2>&1; then
+        printf 'qml6'
+        return 0
+    fi
+
+    if command -v qml >/dev/null 2>&1; then
+        printf 'qml'
+        return 0
+    fi
+
+    fatal 'qml or qml6 is required'
+}
+
+function config-data() {
+    local config=$1 rules=$2 mode=$3 config_text rules_text qml_bin
+
+    [[ -f "$config" && -r "$config" ]] || fatal "config not found: ${config}"
+    [[ -f "$rules" && -r "$rules" ]] || fatal "rules not found: ${rules}"
+    [[ -f "$RULES_QML" && -r "$RULES_QML" ]] || fatal "validator not found: ${RULES_QML}"
+
+    config_text=$(<"$config")
+    rules_text=$(<"$rules")
+    qml_bin=$(qml-runtime)
+
+    QT_FORCE_STDERR_LOGGING=1 \
+        QT_MESSAGE_PATTERN='%{message}' \
+        LC_ALL=C.UTF-8 \
+        LANG=C.UTF-8 \
+        "$qml_bin" -a core "$RULES_QML" -- "$mode" "$config_text" "$rules_text" 2>&1
+}
+
+function config-value() {
+    local mode=$1 config=$2 rules=$3 output
+
+    if ! output=$(config-data "$config" "$rules" "$mode"); then
+        fatal "invalid config: ${config} or rules: ${rules}: ${output}"
+    fi
+
+    printf '%s\n' "$output"
+}
+
+function load-config-settings() {
+    local config=$1 rules=$2 output key value
+
+    output=$(config-value settings "$config" "$rules")
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            desktops) DESKTOPS=$value ;;
+        esac
+    done <<< "$output"
+
+    [[ "$DESKTOPS" =~ ^[1-9][0-9]*$ ]] || fatal "invalid desktops value: ${DESKTOPS}"
+}
+
+function seed-config() {
+    if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        [[ -f "$BUNDLED_CONFIG" && -r "$BUNDLED_CONFIG" ]] \
+            || fatal "bundled config not found: ${BUNDLED_CONFIG}"
+        cp -- "$BUNDLED_CONFIG" "$CONFIG_FILE" || fatal "cannot create config: ${CONFIG_FILE}"
+        note "Created config: ${CONFIG_FILE}"
+    fi
+
+    if [[ ! -e "$RULES_FILE" && ! -L "$RULES_FILE" ]]; then
+        [[ -f "$BUNDLED_RULES" && -r "$BUNDLED_RULES" ]] \
+            || fatal "bundled rules not found: ${BUNDLED_RULES}"
+        cp -- "$BUNDLED_RULES" "$RULES_FILE" || fatal "cannot create rules: ${RULES_FILE}"
+        note "Created rules: ${RULES_FILE}"
+    fi
+}
+
+function package-state() {
+    if [[ ! -e "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]]; then
+        printf 'missing'
+        return 0
+    fi
+
+    if [[ -d "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]] \
+        && [[ -r "${INSTALL_DIR}/metadata.json" ]] \
+        && [[ -r "${INSTALL_DIR}/${PACKAGE_ENTRY}" ]] \
+        && cmp -s -- "${PACKAGE_DIR}/metadata.json" "${INSTALL_DIR}/metadata.json" \
+        && diff -qr -- "${PACKAGE_DIR}/contents" "${INSTALL_DIR}/contents" >/dev/null 2>&1; then
+        printf 'current'
+    elif [[ -d "$INSTALL_DIR" || -L "$INSTALL_DIR" ]]; then
+        printf 'stale'
+    else
+        printf 'invalid'
+    fi
+}
+
+function script-enabled() {
+    [[ "$(kreadconfig6 --file "$KWIN_CONFIG" --group Plugins --key "${SCRIPT_ID}Enabled" --default false)" == 'true' ]]
+}
+
+function script-loaded() {
+    local loaded
+
+    loaded=$(qdbus6 org.kde.KWin /Scripting \
+        org.kde.kwin.Scripting.isScriptLoaded "$SCRIPT_ID" 2>/dev/null) || return 1
+
+    [[ "$loaded" == 'true' ]]
+}
+
+function install-package() {
+    local state
+
+    [[ -r "${PACKAGE_DIR}/metadata.json" ]] || fatal "package metadata not found: ${PACKAGE_DIR}/metadata.json"
+    [[ -r "${PACKAGE_DIR}/${PACKAGE_ENTRY}" ]] || fatal "package entry point not found: ${PACKAGE_DIR}/${PACKAGE_ENTRY}"
+
+    PACKAGE_CHANGED=0
+    state=$(package-state)
+
+    case "$state" in
+        current)
+            note 'Package: unchanged'
+            return 0
+            ;;
+        missing)
+            if ((APPLY)); then
+                note "Installing package: ${INSTALL_DIR}"
+            else
+                note "Package: would install ${INSTALL_DIR}"
+                return 0
+            fi
+            ;;
+        *)
+            if ((APPLY)); then
+                note "Updating package: ${INSTALL_DIR}"
+            else
+                note "Package: would update ${INSTALL_DIR}"
+                return 0
+            fi
+            ;;
+    esac
+
+    rm -rf -- "$INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR" || fatal "cannot create ${INSTALL_DIR}"
+    cp -a -- "${PACKAGE_DIR}/metadata.json" "${PACKAGE_DIR}/contents" "$INSTALL_DIR/" \
+        || fatal "cannot copy package to ${INSTALL_DIR}"
+
+    PACKAGE_CHANGED=1
+}
+
+function load-script() {
+    local load_file="${INSTALL_DIR}/${PACKAGE_ENTRY}"
+    local script_id i
+
+    for ((i = 0; i < 50; ++i)); do
+        if script-loaded; then
+            qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null
+            return 0
+        fi
+
+        script_id=$(qdbus6 org.kde.KWin /Scripting \
+            org.kde.kwin.Scripting.loadDeclarativeScript "$load_file" "$SCRIPT_ID" 2>/dev/null) \
+            || true
+
+        if [[ "$script_id" =~ ^[0-9]+$ ]]; then
+            qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null
+            return 0
+        fi
+
+        sleep 0.02
+    done
+
+    fatal 'failed to load kazulejo into KWin'
+}
+
+function reload-kwin() {
+    qdbus6 org.kde.KWin /Scripting \
+        org.kde.kwin.Scripting.unloadScript "$SCRIPT_ID" >/dev/null 2>&1 || true
+
+    qdbus6 org.kde.KWin /KWin org.kde.KWin.reconfigure >/dev/null
+
+    load-script
+}
+
+function sync-rule-config() {
+    local json=$1
+
+    RULES_CHANGED=0
+
+    if [[ "$(kreadconfig6 --file "$KWIN_CONFIG" --group "$SCRIPT_GROUP" --key "$CONFIG_KEY" --default '')" == "$json" ]]; then
+        note 'Rules: unchanged'
+    elif ((!APPLY)); then
+        note 'Rules: would update'
+    else
+        kwriteconfig6 --file "$KWIN_CONFIG" --group "$SCRIPT_GROUP" --key "$CONFIG_KEY" "$json"
+        RULES_CHANGED=1
+        note 'Rules: updated'
+    fi
+
+    if script-enabled; then
+        note 'Script: enabled'
+    elif ((!APPLY)); then
+        note 'Script: would enable'
+    else
+        kwriteconfig6 --file "$KWIN_CONFIG" --group Plugins --key "${SCRIPT_ID}Enabled" true
+        RULES_CHANGED=1
+        note 'Script: enabled'
+    fi
+}
+
+function reload-if-needed() {
+    if ! kwin-running; then
+        note 'KWin is not running; changes will load on next login'
+        return 0
+    fi
+
+    if ((PACKAGE_CHANGED || RULES_CHANGED || SHORTCUTS_CHANGED)) || ! script-loaded; then
+        if ((!APPLY)); then
+            note 'KWin: would reload'
+            return 0
+        fi
+        note 'Reloading KWin script'
+        reload-kwin
+    else
+        note 'KWin already has the current script and rules'
+    fi
+}
+
+function desktop-uint-property() {
+    local property=$1 line
+
+    line=$(busctl --user get-property "$DESKTOP_MANAGER_DEST" "$DESKTOP_MANAGER_PATH" \
+        "$DESKTOP_MANAGER_IFACE" "$property")
+
+    if [[ "$line" =~ ^u[[:space:]]+([0-9]+)$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        fatal "cannot read ${DESKTOP_MANAGER_IFACE}.${property}: ${line}"
+    fi
+}
+
+function desktop-id-at-position() {
+    local position=$1 line
+
+    line=$(busctl --user get-property "$DESKTOP_MANAGER_DEST" "$DESKTOP_MANAGER_PATH" \
+        "$DESKTOP_MANAGER_IFACE" desktops)
+
+    if [[ "$line" =~ (^|[[:space:]])${position}[[:space:]]+\"([^\"]*)\" ]]; then
+        printf '%s' "${BASH_REMATCH[2]}"
+    fi
+}
+
+function digit-for() {
+    local desktop=$1
+
+    if ((desktop == 10)); then
+        printf '0'
+    else
+        printf '%s' "$desktop"
+    fi
+}
+
+function shortcut-key() {
+    local desktop=$1 shifted=$2
+    local code=$((META_MODIFIER + DIGIT_OFFSET + $(digit-for "$desktop")))
+
+    if ((shifted)); then
+        code=$((code + SHIFT_MODIFIER))
+    fi
+
+    printf '%s' "$code"
+}
+
+# KWin reports Shift+digit as the shifted symbol (for example Meta+! for Meta+Shift+1) instead of the digit with a Shift
+# modifier. Convert that symbol back to the Qt key code that KWin puts in the key event.
+function keysym-qt-key() {
+    local name=$1 out keysym value
+
+    out=$(xkbcli how-to-type --keysym "$name" </dev/null 2>/dev/null) || return 1
+    [[ "$out" =~ \(0x([0-9A-Fa-f]+)\) ]] || return 1
+    keysym=$((16#${BASH_REMATCH[1]}))
+
+    if ((keysym >= 0x01000000)); then
+        value=$((keysym & 0x00ffffff))
+    elif ((keysym <= 0xff)); then
+        value=$keysym
+    else
+        case "$name" in
+            numerosign) value=$((0x2116)) ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    # QXkbCommon uppercases Latin-1 letter keysyms.
+    if ((value >= 0x61 && value <= 0x7a)); then
+        value=$((value - 0x20))
+    fi
+
+    printf '%s' "$value"
+}
+
+# Print "AE01 exclam" style lines for the Shift level of the digit keys in every keyboard layout group. xkbcli reads
+# stdin as a keymap when it is not a terminal, so keep stdin closed.
+function shifted-key-symbols() {
+    xkbcli dump-keymap </dev/null 2>/dev/null | awk '
+        /^[[:space:]]*key <AE(0[1-9]|10)>[[:space:]]*\{/ {
+            match($0, /<AE[0-9]+>/)
+            key = substr($0, RSTART + 1, RLENGTH - 2)
+            next
+        }
+        key != "" && /^[[:space:]]*symbols\[[0-9]+\][[:space:]]*=/ {
+            line = $0
+            sub(/^[^=]*=[[:space:]]*\[[[:space:]]*/, "", line)
+            sub(/[[:space:]]*\].*/, "", line)
+            count = split(line, fields, ",")
+            if (count >= 2) {
+                symbol = fields[2]
+                gsub(/[[:space:]]/, "", symbol)
+                if (symbol != "" && symbol != "NoSymbol")
+                    print key, symbol
+            }
+            next
+        }
+        key != "" && /^[[:space:]]*};/ { key = ""; next }
+    '
+}
+
+function load-shifted-keys() {
+    local key symbol desktop qtkey code
+
+    ((SHIFTED_KEYS_LOADED)) && return 0
+    SHIFTED_KEYS_LOADED=1
+
+    for ((desktop = 1; desktop <= DESKTOPS; ++desktop)); do
+        SHIFTED_KEYS[$desktop]=$(shortcut-key "$desktop" 1)
+    done
+
+    while read -r key symbol; do
+        desktop=$((10#${key#AE}))
+        ((desktop >= 1 && desktop <= DESKTOPS)) || continue
+        qtkey=$(keysym-qt-key "$symbol") || continue
+        code=$((META_MODIFIER + qtkey))
+        [[ " ${SHIFTED_KEYS[$desktop]} " == *" $code "* ]] || SHIFTED_KEYS[$desktop]+=" $code"
+    done < <(shifted-key-symbols)
+}
+
+function same-key-set() {
+    local -n expected=$1
+    local -n actual=$2
+    local expected_sorted actual_sorted
+
+    ((${#expected[@]} == ${#actual[@]})) || return 1
+
+    expected_sorted=$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort -n)
+    actual_sorted=$(printf '%s\n' "${actual[@]}" | LC_ALL=C sort -n)
+    [[ "$expected_sorted" == "$actual_sorted" ]]
+}
+
+function bindings() {
+    local desktop digit label
+
+    load-shifted-keys
+
+    for ((desktop = 1; desktop <= DESKTOPS; ++desktop)); do
+        digit=$(digit-for "$desktop")
+
+        label="Meta+${digit}"
+        printf '%s\t%s\t%s\n' \
+            "Switch to Desktop ${desktop}" "$(shortcut-key "$desktop" 0)" "$label"
+
+        label="Meta+Shift+${digit}"
+        printf '%s\t%s\t%s\n' \
+            "Window to Desktop ${desktop}" "${SHIFTED_KEYS[$desktop]}" "$label"
+    done
+}
+
+function action-shortcut-keys() {
+    local component=$1 action=$2 component_friendly=$3 action_friendly=$4
+    local output key
+    local -a keys
+
+    output=$(busctl --user call "$KGA_DEST" "$KGA_PATH" "$KGA_IFACE" shortcut \
+        as 4 "$component" "$action" "$component_friendly" "$action_friendly")
+
+    read -r -a keys <<< "$output"
+    [[ "${keys[0]:-}" == 'ai' ]] || return 1
+
+    for key in "${keys[@]:2}"; do
+        printf '%s\n' "$key"
+    done
+}
+
+function action-for-key() {
+    local key=$1
+
+    qdbus6 "$KGA_DEST" "$KGA_PATH" "${KGA_IFACE}.action" "$key"
+}
+
+function set-action-shortcut() {
+    local component=$1 action=$2 component_friendly=$3 action_friendly=$4
+    local -a keys
+
+    shift 4
+    keys=("$@")
+
+    busctl --user call "$KGA_DEST" "$KGA_PATH" "$KGA_IFACE" setShortcut \
+        asaiu 4 "$component" "$action" "$component_friendly" "$action_friendly" \
+        "${#keys[@]}" "${keys[@]}" "$KGA_FLAGS" >/dev/null
+}
+
+function ensure-desktops() {
+    local desired=$1 current position name id
+
+    current=$(desktop-uint-property count)
+
+    if ((current == desired)); then
+        note "Virtual desktops: ${current} (unchanged)"
+        return 0
+    fi
+
+    if ((!APPLY)); then
+        if ((current < desired)); then
+            note "Would create $((desired - current)) virtual desktop(s)"
+        else
+            note "Would remove $((current - desired)) virtual desktop(s)"
+        fi
+        return 0
+    fi
+
+    while ((current < desired)); do
+        position=$current
+        name="Desktop $((position + 1))"
+        note "Creating virtual desktop ${name}"
+        qdbus6 "$DESKTOP_MANAGER_DEST" "$DESKTOP_MANAGER_PATH" \
+            "${DESKTOP_MANAGER_IFACE}.createDesktop" "$position" "$name"
+        current=$(desktop-uint-property count)
+
+        ((current > position)) || fatal 'KWin did not create the virtual desktop'
+    done
+
+    while ((current > desired)); do
+        position=$((current - 1))
+        id=$(desktop-id-at-position "$position")
+        [[ -n "$id" ]] || fatal "cannot resolve desktop at position ${position}"
+
+        note "Removing virtual desktop at position ${current}"
+        qdbus6 "$DESKTOP_MANAGER_DEST" "$DESKTOP_MANAGER_PATH" \
+            "${DESKTOP_MANAGER_IFACE}.removeDesktop" "$id"
+
+        (( $(desktop-uint-property count) < current )) || fatal 'KWin did not remove the virtual desktop'
+        current=$(desktop-uint-property count)
+    done
+
+    note "Virtual desktops: ${desired}"
+}
+
+function ensure-single-row() {
+    local rows
+
+    rows=$(desktop-uint-property rows)
+
+    if ((rows == 1)); then
+        ((APPLY)) || note 'Desktop grid: single row (unchanged)'
+        return 0
+    fi
+
+    if ((!APPLY)); then
+        note 'Would set virtual desktop grid to a single row'
+        return 0
+    fi
+
+    note 'Setting virtual desktop grid to a single row'
+    busctl --user set-property "$DESKTOP_MANAGER_DEST" "$DESKTOP_MANAGER_PATH" \
+        "$DESKTOP_MANAGER_IFACE" rows u 1
+}
+
+function desktop-animation-current() {
+    local slide fade
+
+    slide=$(kreadconfig6 --file "$KWIN_CONFIG" --group Plugins --key slideEnabled --default true)
+    fade=$(kreadconfig6 --file "$KWIN_CONFIG" --group Plugins --key fadedesktopEnabled --default false)
+
+    [[ "$slide" == false && "$fade" == true ]]
+}
+
+function ensure-desktop-animation() {
+    if desktop-animation-current; then
+        note 'Desktop animation: fade (unchanged)'
+        return 0
+    fi
+
+    if ((!APPLY)); then
+        note 'Desktop animation: would use fade instead of slide'
+        return 0
+    fi
+
+    kwriteconfig6 --file "$KWIN_CONFIG" --group Plugins --key slideEnabled false
+    kwriteconfig6 --file "$KWIN_CONFIG" --group Plugins --key fadedesktopEnabled true
+    qdbus6 org.kde.KWin /Effects org.kde.kwin.Effects.unloadEffect slide >/dev/null 2>&1 || true
+    qdbus6 org.kde.KWin /Effects org.kde.kwin.Effects.loadEffect fadedesktop >/dev/null
+    note 'Desktop animation: fade'
+}
+
+function task-switcher-group-current() {
+    local group=$1
+
+    [[ "$(kreadconfig6 --file "$KWIN_CONFIG" --group "$group" \
+        --key "$TABBOX_HIGHLIGHT_WINDOWS_KEY" --default true)" == "$TABBOX_HIGHLIGHT_WINDOWS" ]]
+}
+
+function ensure-task-switcher() {
+    local group changed=0
+
+    for group in "$TABBOX_GROUP" "$TABBOX_ALTERNATIVE_GROUP"; do
+        if task-switcher-group-current "$group"; then
+            continue
+        fi
+
+        changed=1
+
+        if ((!APPLY)); then
+            note "Task switcher: would disable show selected window (${group})"
+            continue
+        fi
+
+        kwriteconfig6 --file "$KWIN_CONFIG" --group "$group" \
+            --key "$TABBOX_HIGHLIGHT_WINDOWS_KEY" "$TABBOX_HIGHLIGHT_WINDOWS"
+        note "Task switcher: disabled show selected window (${group})"
+    done
+
+    if ((!changed)); then
+        note 'Task switcher: show selected window off (unchanged)'
+        return 0
+    fi
+
+    ((APPLY)) || return 0
+
+    qdbus6 org.kde.KWin /KWin org.kde.KWin.reconfigure >/dev/null 2>&1 || true
+}
+
+function all-applets() {
+    local line group='' plugin
+
+    [[ -r "$APPLETS_CONFIG" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^\[(.*)\]$ ]]; then
+            group=${BASH_REMATCH[1]}
+            continue
+        fi
+
+        [[ "$line" == plugin=* ]] || continue
+        plugin=${line#plugin=}
+        [[ "$group" =~ ^Containments\]\[([0-9]+)\]\[Applets\]\[([0-9]+)$ ]] || continue
+
+        printf '%s %s %s\n' "$plugin" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    done < "$APPLETS_CONFIG"
+}
+
+function panel-applets() {
+    local plugin containment applet
+
+    while read -r plugin containment applet; do
+        case "$plugin" in
+            "$PAGER_PLUGIN"|org.kde.plasma.icontasks|org.kde.plasma.taskmanager)
+                printf '%s %s %s\n' "$plugin" "$containment" "$applet"
+                ;;
+        esac
+    done < <(all-applets)
+}
+
+function applet-value() {
+    local containment=$1 applet=$2 key=$3
+
+    kreadconfig6 --file "$APPLETS_CONFIG" \
+        --group Containments --group "$containment" \
+        --group Applets --group "$applet" \
+        --group Configuration --group General \
+        --key "$key" --default ''
+}
+
+function applet-settings() {
+    case "$1" in
+        "$PAGER_PLUGIN")
+            printf '%s\n' "displayedText=$PAGER_DISPLAYED_TEXT" \
+                "showWindowIcons=$PAGER_SHOW_WINDOW_ICONS"
+            ;;
+        *)
+            printf '%s\n' "showOnlyCurrentDesktop=$TASK_SHOW_ONLY_CURRENT_DESKTOP" \
+                "groupingStrategy=$TASK_GROUPING_STRATEGY"
+            ;;
+    esac
+}
+
+function applet-needs-update() {
+    local plugin=$1 containment=$2 applet=$3 setting
+
+    while IFS= read -r setting; do
+        [[ "$(applet-value "$containment" "$applet" "${setting%%=*}")" == "${setting#*=}" ]] || return 0
+    done < <(applet-settings "$plugin")
+
+    return 1
+}
+
+function set-applet-value() {
+    local containment=$1 applet=$2 key=$3 value=$4
+
+    kwriteconfig6 --file "$APPLETS_CONFIG" \
+        --group Containments --group "$containment" \
+        --group Applets --group "$applet" \
+        --group Configuration --group General \
+        --key "$key" "$value"
+}
+
+function set-applet-config() {
+    local plugin=$1 containment=$2 applet=$3 setting
+
+    while IFS= read -r setting; do
+        set-applet-value "$containment" "$applet" "${setting%%=*}" "${setting#*=}"
+    done < <(applet-settings "$plugin")
+}
+
+function plasmashell-running() {
+    qdbus6 org.kde.plasmashell /PlasmaShell >/dev/null 2>&1
+}
+
+# Tell the running Plasma session to pick up the panel config immediately.
+# Writing the file alone would only take effect after the next login.
+function apply-panel-config-to-session() {
+    qdbus6 org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript \
+        'var plasma = getApiVersion(1);
+        panels().forEach(function (panel) {
+            panel.widgets().forEach(function (widget) {
+                var type = widget.type;
+                if (type !== "org.kde.plasma.pager" &&
+                    type !== "org.kde.plasma.icontasks" &&
+                    type !== "org.kde.plasma.taskmanager")
+                    return;
+                widget.currentConfigGroup = ["General"];
+                if (type === "org.kde.plasma.pager") {
+                    widget.writeConfig("displayedText", "Number");
+                    widget.writeConfig("showWindowIcons", true);
+                } else {
+                    widget.writeConfig("showOnlyCurrentDesktop", false);
+                    widget.writeConfig("groupingStrategy", 0);
+                }
+                widget.reloadConfig();
+            });
+        });' >/dev/null
+}
+
+function ensure-panel-config() {
+    local plugin containment applet entry found=0 outdated=0
+    local -a applets=()
+
+    if [[ ! -r "$APPLETS_CONFIG" ]]; then
+        note "Panel: ${APPLETS_CONFIG} not found"
+        return 0
+    fi
+
+    mapfile -t applets < <(panel-applets)
+    if ((${#applets[@]} == 0)); then
+        note 'Panel: no configurable applets found'
+        return 0
+    fi
+
+    for entry in "${applets[@]}"; do
+        read -r plugin containment applet <<< "$entry"
+        found=$((found + 1))
+        if applet-needs-update "$plugin" "$containment" "$applet"; then
+            outdated=$((outdated + 1))
+        fi
+    done
+
+    if ((outdated == 0)); then
+        note 'Panel: applet settings (unchanged)'
+        return 0
+    fi
+
+    if ((!APPLY)); then
+        note "Panel: would update applet settings (${outdated}/${found})"
+        return 0
+    fi
+
+    for entry in "${applets[@]}"; do
+        read -r plugin containment applet <<< "$entry"
+        if applet-needs-update "$plugin" "$containment" "$applet"; then
+            set-applet-config "$plugin" "$containment" "$applet"
+        fi
+    done
+
+    note "Panel: updated applet settings (${outdated}/${found})"
+
+    if plasmashell-running; then
+        if apply-panel-config-to-session; then
+            note 'Panel: applied to the running Plasma session'
+        else
+            note 'Panel: could not update the running Plasma session; changes will appear after the next login'
+        fi
+    else
+        note 'Panel: changes will appear after the next Plasma login'
+    fi
+}
+
+function clear-conflicting-key() {
+    local key=$1 target_action=$2 label=$3
+    local -a current_action=()
+    local -a current_keys=()
+    local -a remaining_keys=()
+    local current_key
+
+    mapfile -t current_action < <(action-for-key "$key")
+    ((${#current_action[@]})) || return 0
+
+    if [[ ${current_action[0]} == "$KWIN_COMPONENT" && ${current_action[1]} == "$target_action" ]]; then
+        return 0
+    fi
+
+    if ((!APPLY)); then
+        note "Would remove ${label} from ${current_action[0]}/${current_action[1]}"
+        return 0
+    fi
+
+    note "Removing ${label} from ${current_action[0]}/${current_action[1]}"
+    SHORTCUTS_CHANGED=1
+
+    mapfile -t current_keys < <(
+        action-shortcut-keys "${current_action[0]}" "${current_action[1]}" \
+            "${current_action[2]}" "${current_action[3]}"
+    )
+
+    for current_key in "${current_keys[@]}"; do
+        [[ "$current_key" == "$key" ]] || remaining_keys+=("$current_key")
+    done
+
+    set-action-shortcut "${current_action[0]}" "${current_action[1]}" \
+        "${current_action[2]}" "${current_action[3]}" "${remaining_keys[@]}"
+}
+
+function ensure-binding() {
+    local action=$1 key_list=$2 label=$3
+    local key
+    local -a desired_keys=()
+    local -a current_keys=()
+
+    read -r -a desired_keys <<< "$key_list"
+
+    for key in "${desired_keys[@]}"; do
+        clear-conflicting-key "$key" "$action" "$label"
+    done
+
+    mapfile -t current_keys < <(
+        action-shortcut-keys "$KWIN_COMPONENT" "$action" "$KWIN_COMPONENT_FRIENDLY" "$action"
+    )
+
+    if same-key-set desired_keys current_keys; then
+        note "${action}: ${label} (unchanged)"
+        return 0
+    fi
+
+    if ((!APPLY)); then
+        note "${action}: ${label} (would set)"
+        return 0
+    fi
+
+    note "${action}: ${label}"
+    set-action-shortcut "$KWIN_COMPONENT" "$action" "$KWIN_COMPONENT_FRIENDLY" "$action" "${desired_keys[@]}"
+
+    mapfile -t current_keys < <(
+        action-shortcut-keys "$KWIN_COMPONENT" "$action" "$KWIN_COMPONENT_FRIENDLY" "$action"
+    )
+
+    if ! same-key-set desired_keys current_keys; then
+        fatal "failed to set ${action} to ${label}"
+    fi
+}
+
+function apply-shortcuts() {
+    local action key label
+
+    while IFS=$'\t' read -r action key label; do
+        ensure-binding "$action" "$key" "$label"
+    done < <(bindings)
+}
+
+# KWin remembers shortcut assignments per action name and treats a ShortcutHandler's declared sequence only as a
+# default. Replacing a keymap in config.json therefore leaves the previous key bound unless the stored assignment is
+# overwritten. Set the action to exactly the configured key so stale keys are dropped as well.
+function ensure-keymap-binding() {
+    local key=$1 action=$2 label=$3
+    local action_friendly=${action#Kazulejo: }
+    local -a desired_keys=("$key")
+    local -a current_keys=()
+    local i
+
+    mapfile -t current_keys < <(
+        action-shortcut-keys "$KWIN_COMPONENT" "$action" \
+            "$KWIN_COMPONENT_FRIENDLY" "$action_friendly"
+    )
+
+    if same-key-set desired_keys current_keys; then
+        note "${action}: ${label} (unchanged)"
+        return 0
+    fi
+
+    if ((!APPLY)); then
+        note "${action}: ${label} (would set)"
+        return 0
+    fi
+
+    note "${action}: ${label}"
+
+    # The action exists only after the script has registered its ShortcutHandler. Retry briefly so a just-loaded script
+    # has a chance to appear before reporting a failure.
+    for ((i = 0; i < 50; ++i)); do
+        set-action-shortcut "$KWIN_COMPONENT" "$action" \
+            "$KWIN_COMPONENT_FRIENDLY" "$action_friendly" "${desired_keys[@]}"
+
+        mapfile -t current_keys < <(
+            action-shortcut-keys "$KWIN_COMPONENT" "$action" \
+                "$KWIN_COMPONENT_FRIENDLY" "$action_friendly"
+        )
+
+        if same-key-set desired_keys current_keys; then
+            SHORTCUTS_CHANGED=1
+            return 0
+        fi
+
+        sleep 0.02
+    done
+
+    fatal "failed to set ${action} to ${label}"
+}
+
+# KWin's built-in quick-tile actions use the same Meta+arrow keys by default.
+# Remove each configured keymap from whichever action currently owns it so the script can register its own
+# ShortcutHandler for that sequence.
+function apply-keymap-conflicts() {
+    local config=$1 rules=$2 key action label
+
+    while IFS=$'\t' read -r key action label; do
+        [[ -n "$key" ]] || continue
+        clear-conflicting-key "$key" "$action" "$label"
+    done < <(config-value keymaps "$config" "$rules")
+}
+
+function apply-keymap-bindings() {
+    local config=$1 rules=$2 key action label
+
+    while IFS=$'\t' read -r key action label; do
+        [[ -n "$key" ]] || continue
+        ensure-keymap-binding "$key" "$action" "$label"
+    done < <(config-value keymaps "$config" "$rules")
+}
+
+function desktop-exec-arg() {
+    local value=$1
+
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//\`/\\\`}
+    value=${value//\$/\\\$}
+    value=${value//%/%%}
+
+    printf '"%s"' "$value"
+}
+
+function install-autostart() {
+    local desired current tmp
+
+    desired=$(
+        cat <<EO_AUTOSTART
+[Desktop Entry]
+Type=Application
+Name=Kazulejo
+Comment=Apply Kazulejo setup and window rules at login
+Exec=$(desktop-exec-arg "$SCRIPT_PATH") --apply --quiet
+Terminal=false
+NoDisplay=true
+X-KDE-autostart-phase=2
+OnlyShowIn=KDE;
+EO_AUTOSTART
+    )
+
+    if [[ -r "$AUTOSTART_FILE" ]]; then
+        current=$(<"$AUTOSTART_FILE")
+        if [[ "$current" == "$desired" ]]; then
+            note 'Autostart: unchanged'
+            return 0
+        fi
+    fi
+
+    if ((!APPLY)); then
+        if [[ -e "$AUTOSTART_FILE" ]]; then
+            note 'Autostart: would update'
+        else
+            note 'Autostart: would install'
+        fi
+        return 0
+    fi
+
+    mkdir -p "$AUTOSTART_DIR"
+    tmp=$(mktemp "${AUTOSTART_DIR}/.kazulejo.XXXXXX")
+    printf '%s\n' "$desired" > "$tmp"
+    chmod 644 "$tmp"
+    mv -f -- "$tmp" "$AUTOSTART_FILE"
+
+    note "Autostart: installed (${AUTOSTART_FILE})"
+}
+
+function main() {
+    local config rules json
+
+    if ((${#argc__positionals[@]})); then
+        printf 'error: unexpected argument: %s\n' "${argc__positionals[0]}" >&2
+        exit 2
+    fi
+
+    if [[ -n "${argc_quiet:-}" ]]; then
+        QUIET=1
+    fi
+
+    if [[ -n "${argc_apply:-}" ]]; then
+        APPLY=1
+
+        if [[ ! -e "$CONFIG_FILE" || ! -e "$RULES_FILE" ]]; then
+            seed-config
+        fi
+    fi
+
+    config=$(resolve-file "$CONFIG_FILE" "$BUNDLED_CONFIG" config)
+    rules=$(resolve-file "$RULES_FILE" "$BUNDLED_RULES" rules)
+    load-config-settings "$config" "$rules"
+    json=$(config-value json "$config" "$rules")
+
+    note "Config: ${config}"
+    note "Rules: ${rules}"
+
+    if ((!APPLY)); then
+        printf '%s\n' "$(config-value table "$config" "$rules")"
+
+        if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
+            printf 'User config: would create %s\n' "$CONFIG_FILE"
+        fi
+
+        if [[ ! -e "$RULES_FILE" && ! -L "$RULES_FILE" ]]; then
+            printf 'Rules file: would create %s\n' "$RULES_FILE"
+        fi
+    fi
+
+    install-package
+    sync-rule-config "$json"
+    install-autostart
+    ensure-panel-config
+
+    if kwin-running; then
+        ensure-desktops "$DESKTOPS"
+        ensure-single-row
+        ensure-desktop-animation
+        ensure-task-switcher
+        apply-shortcuts
+        apply-keymap-conflicts "$config" "$rules"
+        reload-if-needed
+        apply-keymap-bindings "$config" "$rules"
+    elif ((APPLY)); then
+        note 'KWin is not running; package, config, autostart, and panel settings are installed'
+        note 'Run --apply again after logging in to configure desktops and shortcuts'
+    else
+        note 'KWin is not running; changes would load on next login'
+    fi
+
+    if ((APPLY)); then
+        note "Setup complete (config: ${config}, rules: ${rules})"
+    else
+        note 'Preview complete; rerun with --apply to make changes'
+    fi
+}
+
+eval "$("$ARGC_BIN" --argc-eval "$0" "$@")"

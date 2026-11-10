@@ -1,0 +1,4 @@
+[tools]
+argc = "latest"
+just = "latest"
+shellcheck = "latest"

@@ -1,0 +1,71 @@
+{
+  "desktops": 10,
+  "gap": 4,
+  "keymaps": [
+    {
+      "action": "close-window",
+      "mapping": [
+        "meta",
+        "q"
+      ]
+    },
+    {
+      "action": "focus-left",
+      "mapping": [
+        "meta",
+        "h"
+      ]
+    },
+    {
+      "action": "focus-right",
+      "mapping": [
+        "meta",
+        "l"
+      ]
+    },
+    {
+      "action": "focus-up",
+      "mapping": [
+        "meta",
+        "k"
+      ]
+    },
+    {
+      "action": "focus-down",
+      "mapping": [
+        "meta",
+        "j"
+      ]
+    },
+    {
+      "action": "move-window-left",
+      "mapping": [
+        "meta",
+        "left"
+      ]
+    },
+    {
+      "action": "move-window-right",
+      "mapping": [
+        "meta",
+        "right"
+      ]
+    },
+    {
+      "action": "toggle-fullscreen",
+      "mapping": [
+        "meta",
+        "up"
+      ]
+    },
+    {
+      "action": "toggle-floating",
+      "mapping": [
+        "meta",
+        "down"
+      ]
+    }
+  ],
+  "layout": "master-stack",
+  "masterRatio": 0.6
+}

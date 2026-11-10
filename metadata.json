@@ -1,0 +1,15 @@
+{
+  "KPackageStructure": "KWin/Script",
+  "KPlugin": {
+    "Id": "kazulejo",
+    "Name": "Kazulejo",
+    "Description": "Class-based window rules and a configurable tiling layout",
+    "Icon": "preferences-system-windows",
+    "License": "MIT",
+    "Version": "0.8.0",
+    "EnabledByDefault": false
+  },
+  "X-Plasma-API": "declarativescript",
+  "X-Plasma-API-Minimum-Version": "6.8",
+  "X-Plasma-MainScript": "ui/main.qml"
+}
